@@ -1,0 +1,29 @@
+# Environment - NEVER commit this
+.env
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Database (contains trade history)
+data/
+
+# Logs
+logs/
+
+# SSH Keys
+*.key
+*.pem
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Puppeteer cache
+.cache/

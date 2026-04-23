@@ -1,0 +1,60 @@
+name: APEX Giveaway Bot
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  giveaway-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser
+
+      - name: Run giveaway check
+        env:
+          X_USERNAME: ${{ secrets.X_USERNAME }}
+          X_EMAIL: ${{ secrets.X_EMAIL }}
+          X_PASSWORD: ${{ secrets.X_PASSWORD }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WALLET_USDT_ERC20: ${{ secrets.WALLET_USDT_ERC20 }}
+          WALLET_BTC: ${{ secrets.WALLET_BTC }}
+          WALLET_SOL: ${{ secrets.WALLET_SOL }}
+          METAWIN_ID: ${{ secrets.METAWIN_ID }}
+          TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
+          NODE_ENV: production
+          PUPPETEER_HEADLESS: 'true'
+          DB_PATH: ./data/apex.db
+          LOG_PATH: ./logs/apex.log
+          MAX_DAILY_ACTIONS: '20'
+          MAX_ACTIONS_PER_RUN: '5'
+          ACTION_DELAY_MIN: '3000'
+          ACTION_DELAY_MAX: '8000'
+        run: npx ts-node src/giveawayBot.ts --standalone
+
+      - name: Upload logs (if failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: giveaway-logs
+          path: logs/
+          retention-days: 3

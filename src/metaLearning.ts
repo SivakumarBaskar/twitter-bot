@@ -1,14 +1,33 @@
+// ════════════════════════════════════════════════════
+// APEX BOT v7.0 — META LEARNING (REWRITTEN)
+// Analyzes trade results weekly
+// Auto-adjusts adaptive parameters per asset
+// Posts weekly insight to X + Telegram
+// Integrates content performance insights
+// ════════════════════════════════════════════════════
+
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { config } from './config';
-import { tradeDB, adaptiveDB, signalDB, eventDB } from './database';
-import { generateWeeklyAnalysis } from './commentGen';
+import { tradeDB, adaptiveDB, eventDB } from './database';
 import { sendTelegram } from './telegram';
+import { getUniqueTemplate } from './templates';
+import { getContentInsights } from './contentLearning';
 import type {
-  AdaptiveParams,
   PerformanceMetrics,
   AssetPerformance,
   SessionPerformance,
   TradeRecord,
+  AdaptiveParams,
 } from './types';
+import {
+  launchBrowser,
+  loginToX,
+  postTweet,
+  closeBrowser,
+} from './puppeteerEngine';
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
 // ════════════════════════════════════════════════════
 // WEEKLY PERFORMANCE ANALYSIS
@@ -19,28 +38,24 @@ export async function runWeeklyAnalysis(): Promise<PerformanceMetrics> {
   const trades = tradeDB.getLast7Days();
 
   if (trades.length === 0) {
-    console.log('No trades this week to analyze');
+    console.log('   No trades this week to analyze');
     return buildEmptyMetrics();
   }
 
-  // ── OVERALL STATS ──────────────────────────────────
   const wins = trades.filter(t => t.pnlPips > 0).length;
   const losses = trades.filter(t => t.pnlPips <= 0).length;
   const winRate = (wins / trades.length) * 100;
-  const totalPips = trades.reduce((sum, t) => sum + t.pnlPips, 0);
-  const avgRR = calculateAvgRR(trades);
-  const maxDrawdown = calculateMaxDrawdown(trades);
+  const totalPips = trades.reduce((s, t) => s + t.pnlPips, 0);
+  const avgRR = calcAvgRR(trades);
+  const maxDrawdown = calcMaxDrawdown(trades);
 
-  // ── PER ASSET BREAKDOWN ────────────────────────────
   const byAsset = buildAssetBreakdown(trades);
-
-  // ── PER SESSION BREAKDOWN ─────────────────────────
   const bySession = buildSessionBreakdown(trades);
-
-  // ── PER CONFLUENCE SCORE ──────────────────────────
   const byConfluence = buildConfluenceBreakdown(trades);
 
-  const metrics: PerformanceMetrics = {
+  console.log(`   ✅ Analysis: ${trades.length} trades, ${winRate.toFixed(1)}% WR, ${totalPips > 0 ? '+' : ''}${totalPips.toFixed(1)} pips`);
+
+  return {
     period: 'last_7_days',
     totalTrades: trades.length,
     wins,
@@ -53,102 +68,81 @@ export async function runWeeklyAnalysis(): Promise<PerformanceMetrics> {
     bySession,
     byConfluence,
   };
-
-  console.log(`✅ Analysis complete: ${trades.length} trades, ${winRate.toFixed(1)}% win rate`);
-
-  return metrics;
 }
 
 // ════════════════════════════════════════════════════
-// AUTO-ADJUST PARAMETERS (The Learning Part)
+// AUTO-ADJUST PARAMETERS
 // ════════════════════════════════════════════════════
-export async function adjustParameters(
-  metrics: PerformanceMetrics
-): Promise<void> {
-  console.log('\n⚙️ Auto-adjusting parameters based on performance...');
-
+export async function adjustParameters(metrics: PerformanceMetrics): Promise<void> {
+  console.log('\n⚙️ Auto-adjusting parameters...');
   const adjustments: string[] = [];
 
-  // ── GLOBAL ADJUSTMENTS ────────────────────────────
-
-  // If overall win rate < 45%, raise minimum confluence score
+  // Global: raise confluence requirement if WR too low
   if (metrics.winRate < 45 && metrics.totalTrades >= 5) {
-    const currentMin = config.strategy.minConfluenceScore;
-    if (currentMin < 4) {
-      console.log('  📈 Win rate low — raising minimum confluence score to 4');
-      adjustments.push('Raised global min confluence to 4 (low win rate)');
-      // Note: This updates runtime config
+    const cur = config.strategy.minConfluenceScore as number;
+    if (cur < 4) {
       (config.strategy as any).minConfluenceScore = 4;
+      adjustments.push('Global: raised min confluence to 4 (WR below 45%)');
     }
   }
 
-  // If win rate > 65%, we can be slightly more lenient
-  if (metrics.winRate > 65 && metrics.totalTrades >= 10) {
-    const currentMin = config.strategy.minConfluenceScore;
-    if (currentMin > 3) {
-      console.log('  📉 Win rate high — can relax confluence to 3');
-      adjustments.push('Relaxed global min confluence to 3 (high win rate)');
+  // Global: relax if WR very high
+  if (metrics.winRate > 68 && metrics.totalTrades >= 10) {
+    const cur = config.strategy.minConfluenceScore as number;
+    if (cur > 3) {
       (config.strategy as any).minConfluenceScore = 3;
+      adjustments.push('Global: relaxed min confluence to 3 (WR above 68%)');
     }
   }
 
-  // If max drawdown > 8%, reduce risk
+  // Global: reduce risk if drawdown high
   if (metrics.maxDrawdown > 8) {
-    console.log('  ⚠️ High drawdown — reducing risk per trade');
-    adjustments.push('Reduced risk per trade (drawdown > 8%)');
-    (config.strategy as any).riskPerTrade = Math.max(
-      0.5,
-      config.strategy.riskPerTrade - 0.25
-    );
+    const cur = config.strategy.riskPerTrade as number;
+    const newRisk = Math.max(0.5, cur - 0.25);
+    (config.strategy as any).riskPerTrade = newRisk;
+    adjustments.push(`Global: risk reduced to ${newRisk}% (drawdown ${metrics.maxDrawdown.toFixed(1)}%)`);
   }
 
-  // ── PER ASSET ADJUSTMENTS ─────────────────────────
+  // Per-asset adjustments
   for (const [symbol, perf] of Object.entries(metrics.byAsset)) {
-    if (perf.trades < 3) continue; // Not enough data
+    if (perf.trades < 3) continue;
 
-    const currentParams = adaptiveDB.get(symbol);
+    const params = adaptiveDB.get(symbol);
     let updated = false;
     const reasons: string[] = [];
 
-    // Poor win rate on this asset — tighten RSI
+    // Poor WR: tighten requirements
     if (perf.winRate < 40) {
-      const newOverbought = Math.min(75, currentParams.rsiOverbought + 2);
-      const newOversold = Math.max(25, currentParams.rsiOversold - 2);
-      currentParams.rsiOverbought = newOverbought;
-      currentParams.rsiOversold = newOversold;
-      currentParams.minConfluenceScore = Math.min(5,
-        currentParams.minConfluenceScore + 1);
-      reasons.push(`low win rate (${perf.winRate.toFixed(0)}%)`);
+      params.rsiOverbought = Math.min(75, params.rsiOverbought + 2);
+      params.rsiOversold = Math.max(25, params.rsiOversold - 2);
+      params.minConfluenceScore = Math.min(5, params.minConfluenceScore + 1);
+      reasons.push(`low WR (${perf.winRate.toFixed(0)}%) — tightened`);
       updated = true;
     }
 
-    // Great win rate — can use current levels or slightly relax
+    // Good WR: can slightly relax
     if (perf.winRate > 70 && perf.trades >= 5) {
-      const newOverbought = Math.max(65, currentParams.rsiOverbought - 1);
-      currentParams.rsiOverbought = newOverbought;
-      reasons.push(`high win rate (${perf.winRate.toFixed(0)}%)`);
+      params.minConfluenceScore = Math.max(3, params.minConfluenceScore - 1);
+      reasons.push(`high WR (${perf.winRate.toFixed(0)}%) — relaxed`);
       updated = true;
     }
 
-    // Update preferred sessions based on where wins happened
-    if (perf.bestSession && perf.trades >= 5) {
-      if (!currentParams.preferredSessions.includes(perf.bestSession)) {
-        currentParams.preferredSessions = [perf.bestSession];
-        reasons.push(`best in ${perf.bestSession} session`);
-        updated = true;
-      }
+    // Update preferred sessions based on where wins came from
+    if (perf.bestSession && perf.trades >= 5 && !params.preferredSessions.includes(perf.bestSession)) {
+      params.preferredSessions = [perf.bestSession];
+      reasons.push(`best session: ${perf.bestSession}`);
+      updated = true;
     }
 
     if (updated) {
-      currentParams.lastUpdated = Date.now();
-      currentParams.updateReason = reasons.join(', ');
-      adaptiveDB.save(currentParams);
-      console.log(`  ✅ Updated params for ${symbol}: ${reasons.join(', ')}`);
+      params.lastUpdated = Date.now();
+      params.updateReason = reasons.join(', ');
+      adaptiveDB.save(params);
       adjustments.push(`${symbol}: ${reasons.join(', ')}`);
+      console.log(`   ✅ Updated ${symbol}: ${reasons.join(', ')}`);
     }
   }
 
-  // ── NOTIFY ADJUSTMENTS ────────────────────────────
   if (adjustments.length > 0) {
     await sendTelegram({
       type: 'INFO',
@@ -159,210 +153,245 @@ export async function adjustParameters(
 
     eventDB.log('META_LEARNING', 'Parameters adjusted', { adjustments });
   } else {
-    console.log('  ✅ No adjustments needed this week');
+    console.log('   ✅ No adjustments needed this week');
   }
 }
 
 // ════════════════════════════════════════════════════
-// WEEKLY REPORT GENERATION & POSTING
+// GENERATE AND SEND WEEKLY REPORT
+// Posts to X via template AND sends detail to Telegram
 // ════════════════════════════════════════════════════
 export async function generateAndSendWeeklyReport(
   metrics: PerformanceMetrics
 ): Promise<void> {
 
-  // Find top and worst performers
-  const assetEntries = Object.entries(metrics.byAsset);
-  const sorted = assetEntries.sort((a, b) => b[1].winRate - a[1].winRate);
+  const sorted = Object.entries(metrics.byAsset)
+    .sort(([, a], [, b]) => b.winRate - a.winRate);
   const topAsset = sorted[0]?.[0] || 'N/A';
   const worstAsset = sorted[sorted.length - 1]?.[0] || 'N/A';
 
-  // Generate AI summary
-  const weeklyPost = await generateWeeklyAnalysis({
-    totalTrades: metrics.totalTrades,
+  // Get content learning insights
+  let contentInsight = '';
+  try {
+    const ci = getContentInsights();
+    if (ci.totalPostsTracked >= 3) {
+      contentInsight = `Best content category: ${ci.bestCategory} (${ci.bestDay}s perform best)`;
+    }
+  } catch {
+    // Content learning might not have data yet
+  }
+
+  // Build vars for weekly insight template
+  const vars: any = {
+    asset: topAsset,
+    direction: 'LONG',
+    entry: 0,
+    stopLoss: 0,
+    tp1: 0,
+    tp2: 0,
+    rr: metrics.avgRR.toFixed(1),
+    triggers: '',
+    session: 'Weekly',
+    signalsToday: metrics.totalTrades,
+    wins: metrics.wins,
+    losses: metrics.losses,
     winRate: metrics.winRate,
-    topAsset,
-    worstAsset,
+    totalPips: Math.round(metrics.totalPips),
     avgRR: metrics.avgRR,
-    totalPips: metrics.totalPips,
-    suggestions: [],
-  });
+    bestAsset: topAsset,
+    worstAsset: worstAsset,
+  };
+
+  // Post weekly insight to X
+  const xPost = getUniqueTemplate('weekly_insight', vars);
+
+  if (xPost) {
+    const finalText = xPost.length > 280
+      ? xPost.substring(0, 277) + '...'
+      : xPost;
+
+    try {
+      const { launchBrowser, loginToX, postTweet, closeBrowser } = await import('./puppeteerEngine');
+      await launchBrowser();
+      const loggedIn = await loginToX();
+      if (loggedIn) {
+        await postTweet(finalText);
+        console.log('   ✅ Weekly insight posted to X');
+      }
+      await closeBrowser();
+    } catch (error) {
+      console.error('   ❌ Failed to post weekly insight to X:', error);
+      try { await closeBrowser(); } catch {}
+    }
+  }
 
   // Detailed Telegram report
-  const telegramReport = buildTelegramWeeklyReport(metrics, topAsset, worstAsset);
+  const sessionLines = Object.entries(metrics.bySession)
+    .map(([s, p]) => `  ${s}: ${p.wins}/${p.trades} (${p.winRate.toFixed(0)}% WR)`);
+
+  const telegramBody = [
+    `Period: Last 7 days`,
+    `Trades: ${metrics.totalTrades}  ✅${metrics.wins} / ❌${metrics.losses}`,
+    `Win Rate: ${metrics.winRate.toFixed(1)}%`,
+    `Avg RR: ${metrics.avgRR.toFixed(2)}:1`,
+    `Total Pips: ${metrics.totalPips > 0 ? '+' : ''}${Math.round(metrics.totalPips)}`,
+    `Max Drawdown: ${metrics.maxDrawdown.toFixed(1)}%`,
+    '',
+    `🏆 Best Asset: ${topAsset}`,
+    `⚠️ Worst Asset: ${worstAsset}`,
+    '',
+    'Session Performance:',
+    ...sessionLines,
+    '',
+    contentInsight ? `📝 Content: ${contentInsight}` : '',
+    '',
+    '🧠 Parameters auto-adjusted for next week',
+  ].filter(Boolean).join('\n');
 
   await sendTelegram({
     type: 'WEEKLY_REPORT',
     title: '📊 Weekly Performance Report',
-    body: telegramReport,
+    body: telegramBody,
     timestamp: Date.now(),
   });
 
-  console.log('✅ Weekly report sent to Telegram');
-  console.log('📝 X post prepared:', weeklyPost.substring(0, 100));
+  console.log('   ✅ Weekly report sent to Telegram');
 
-  // Return the post for the trading bot to post to X
-  eventDB.log('WEEKLY_REPORT', 'Weekly report generated', {
-    metrics: {
-      totalTrades: metrics.totalTrades,
-      winRate: metrics.winRate,
-      totalPips: metrics.totalPips,
-    },
-    xPost: weeklyPost,
-  });
+  // Also try Gemini analysis for extra insight
+  await runGeminiWeeklyAnalysis(metrics, topAsset, worstAsset);
+}
+
+// ════════════════════════════════════════════════════
+// GEMINI ANALYSIS (optional enhancement)
+// ════════════════════════════════════════════════════
+async function runGeminiWeeklyAnalysis(
+  metrics: PerformanceMetrics,
+  topAsset: string,
+  worstAsset: string
+): Promise<void> {
+  try {
+    const prompt = `You are an expert algo trading analyst reviewing a week of results.
+
+Stats:
+- Trades: ${metrics.totalTrades}
+- Win Rate: ${metrics.winRate.toFixed(1)}%
+- Avg RR: ${metrics.avgRR.toFixed(2)}:1
+- Total Pips: ${Math.round(metrics.totalPips)}
+- Best Asset: ${topAsset}
+- Worst Asset: ${worstAsset}
+- Max Drawdown: ${metrics.maxDrawdown.toFixed(1)}%
+
+In 3 bullet points (max 30 words each), what should be adjusted next week? Be specific about asset focus, session preference, or risk level. No generic advice.`;
+
+    const result = await model.generateContent(prompt);
+    const analysis = result.response.text().trim();
+
+    if (analysis) {
+      await sendTelegram({
+        type: 'INFO',
+        title: '🤖 Gemini Weekly Analysis',
+        body: analysis,
+        timestamp: Date.now(),
+      });
+    }
+  } catch {
+    // Gemini call failing is not critical
+  }
 }
 
 // ════════════════════════════════════════════════════
 // HELPERS
 // ════════════════════════════════════════════════════
-function buildAssetBreakdown(
-  trades: TradeRecord[]
-): Record<string, AssetPerformance> {
-  const breakdown: Record<string, AssetPerformance> = {};
+function buildAssetBreakdown(trades: TradeRecord[]): Record<string, AssetPerformance> {
+  const map: Record<string, { trades: number; wins: number; pips: number; sessions: Record<string, { wins: number; total: number }> }> = {};
 
-  for (const trade of trades) {
-    if (!breakdown[trade.symbol]) {
-      breakdown[trade.symbol] = {
-        symbol: trade.symbol,
-        trades: 0,
-        wins: 0,
-        winRate: 0,
-        avgPips: 0,
-        bestSession: '',
-      };
-    }
+  for (const t of trades) {
+    if (!map[t.symbol]) map[t.symbol] = { trades: 0, wins: 0, pips: 0, sessions: {} };
+    map[t.symbol].trades++;
+    if (t.pnlPips > 0) map[t.symbol].wins++;
+    map[t.symbol].pips += t.pnlPips;
 
-    const asset = breakdown[trade.symbol];
-    asset.trades++;
-    if (trade.pnlPips > 0) asset.wins++;
-    asset.avgPips = ((asset.avgPips * (asset.trades - 1)) + trade.pnlPips) / asset.trades;
+    if (!map[t.symbol].sessions[t.session]) map[t.symbol].sessions[t.session] = { wins: 0, total: 0 };
+    map[t.symbol].sessions[t.session].total++;
+    if (t.pnlPips > 0) map[t.symbol].sessions[t.session].wins++;
   }
 
-  // Calculate win rates and best sessions
-  for (const symbol of Object.keys(breakdown)) {
-    const asset = breakdown[symbol];
-    asset.winRate = (asset.wins / asset.trades) * 100;
-
-    // Find best session for this asset
-    const assetTrades = trades.filter(t => t.symbol === symbol);
-    const sessionWins: Record<string, number> = {};
-    const sessionTrades: Record<string, number> = {};
-
-    for (const trade of assetTrades) {
-      sessionTrades[trade.session] = (sessionTrades[trade.session] || 0) + 1;
-      if (trade.pnlPips > 0) {
-        sessionWins[trade.session] = (sessionWins[trade.session] || 0) + 1;
-      }
-    }
-
+  const result: Record<string, AssetPerformance> = {};
+  for (const [sym, data] of Object.entries(map)) {
     let bestSession = '';
-    let bestWinRate = 0;
-    for (const session of Object.keys(sessionTrades)) {
-      const wr = ((sessionWins[session] || 0) / sessionTrades[session]) * 100;
-      if (wr > bestWinRate) {
-        bestWinRate = wr;
-        bestSession = session;
-      }
-    }
-    asset.bestSession = bestSession;
-  }
-
-  return breakdown;
-}
-
-function buildSessionBreakdown(
-  trades: TradeRecord[]
-): Record<string, SessionPerformance> {
-  const breakdown: Record<string, SessionPerformance> = {};
-
-  for (const trade of trades) {
-    if (!breakdown[trade.session]) {
-      breakdown[trade.session] = {
-        session: trade.session,
-        trades: 0,
-        wins: 0,
-        winRate: 0,
-        avgPips: 0,
-      };
+    let bestSessionWR = 0;
+    for (const [sess, sd] of Object.entries(data.sessions)) {
+      const wr = sd.total > 0 ? sd.wins / sd.total : 0;
+      if (wr > bestSessionWR) { bestSessionWR = wr; bestSession = sess; }
     }
 
-    const session = breakdown[trade.session];
-    session.trades++;
-    if (trade.pnlPips > 0) session.wins++;
-    session.avgPips = ((session.avgPips * (session.trades - 1)) + trade.pnlPips) / session.trades;
-    session.winRate = (session.wins / session.trades) * 100;
+    result[sym] = {
+      symbol: sym,
+      trades: data.trades,
+      wins: data.wins,
+      winRate: data.trades > 0 ? (data.wins / data.trades) * 100 : 0,
+      avgPips: data.trades > 0 ? data.pips / data.trades : 0,
+      bestSession,
+    };
   }
-
-  return breakdown;
+  return result;
 }
 
-function buildConfluenceBreakdown(
-  trades: TradeRecord[]
-): Record<number, number> {
-  const breakdown: Record<number, number> = {};
+function buildSessionBreakdown(trades: TradeRecord[]): Record<string, SessionPerformance> {
+  const map: Record<string, { trades: number; wins: number; pips: number }> = {};
 
-  for (const trade of trades) {
-    const score = trade.confluenceScore;
-    if (!breakdown[score]) breakdown[score] = 0;
-    if (trade.pnlPips > 0) breakdown[score]++;
+  for (const t of trades) {
+    if (!map[t.session]) map[t.session] = { trades: 0, wins: 0, pips: 0 };
+    map[t.session].trades++;
+    if (t.pnlPips > 0) map[t.session].wins++;
+    map[t.session].pips += t.pnlPips;
   }
 
-  return breakdown;
+  const result: Record<string, SessionPerformance> = {};
+  for (const [sess, data] of Object.entries(map)) {
+    result[sess] = {
+      session: sess,
+      trades: data.trades,
+      wins: data.wins,
+      winRate: data.trades > 0 ? (data.wins / data.trades) * 100 : 0,
+      avgPips: data.trades > 0 ? data.pips / data.trades : 0,
+    };
+  }
+  return result;
 }
 
-function calculateAvgRR(trades: TradeRecord[]): number {
+function buildConfluenceBreakdown(trades: TradeRecord[]): Record<number, number> {
+  const map: Record<number, number> = {};
+  for (const t of trades) {
+    if (!map[t.confluenceScore]) map[t.confluenceScore] = 0;
+    if (t.pnlPips > 0) map[t.confluenceScore]++;
+  }
+  return map;
+}
+
+function calcAvgRR(trades: TradeRecord[]): number {
   const winners = trades.filter(t => t.pnlPips > 0);
   const losers = trades.filter(t => t.pnlPips <= 0);
-  if (losers.length === 0) return 3;
+  if (losers.length === 0 || winners.length === 0) return 0;
 
-  const avgWin = winners.reduce((s, t) => s + t.pnlPips, 0) / (winners.length || 1);
+  const avgWin = winners.reduce((s, t) => s + t.pnlPips, 0) / winners.length;
   const avgLoss = Math.abs(losers.reduce((s, t) => s + t.pnlPips, 0)) / losers.length;
 
-  return avgLoss > 0 ? avgWin / avgLoss : 1;
+  return avgLoss > 0 ? parseFloat((avgWin / avgLoss).toFixed(2)) : 0;
 }
 
-function calculateMaxDrawdown(trades: TradeRecord[]): number {
+function calcMaxDrawdown(trades: TradeRecord[]): number {
   let peak = 0;
   let equity = 0;
   let maxDD = 0;
 
-  for (const trade of trades) {
-    equity += trade.pnlPercent;
+  for (const t of trades) {
+    equity += t.pnlPercent || 0;
     if (equity > peak) peak = equity;
     const dd = peak - equity;
     if (dd > maxDD) maxDD = dd;
   }
-
-  return maxDD;
-}
-
-function buildTelegramWeeklyReport(
-  metrics: PerformanceMetrics,
-  topAsset: string,
-  worstAsset: string
-): string {
-  const lines = [
-    `📅 Week Summary`,
-    ``,
-    `Total Trades: ${metrics.totalTrades}`,
-    `✅ Wins: ${metrics.wins}`,
-    `❌ Losses: ${metrics.losses}`,
-    `Win Rate: ${metrics.winRate.toFixed(1)}%`,
-    `Avg RR: ${metrics.avgRR.toFixed(2)}`,
-    `Total Pips: ${metrics.totalPips > 0 ? '+' : ''}${metrics.totalPips.toFixed(1)}`,
-    `Max Drawdown: ${metrics.maxDrawdown.toFixed(1)}%`,
-    ``,
-    `🏆 Best Asset: ${topAsset}`,
-    `⚠️ Worst Asset: ${worstAsset}`,
-    ``,
-    `Session Performance:`,
-    ...Object.entries(metrics.bySession).map(([s, p]) =>
-      `  ${s}: ${p.wins}/${p.trades} (${p.winRate.toFixed(0)}%)`
-    ),
-    ``,
-    `🧠 Parameters auto-adjusted for next week`,
-  ];
-
-  return lines.join('\n');
+  return parseFloat(maxDD.toFixed(2));
 }
 
 function buildEmptyMetrics(): PerformanceMetrics {

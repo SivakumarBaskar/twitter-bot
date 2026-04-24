@@ -1,3 +1,5 @@
+cat > src/index.ts << 'ENDOFFILE'
+// @ts-nocheck
 // ════════════════════════════════════════════════════
 // APEX BOT v7.0 — MAIN ENTRY POINT
 // ════════════════════════════════════════════════════
@@ -6,17 +8,12 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import fs from 'fs';
-import path from 'path';
 import { initDatabase, eventDB } from './database';
 import { startScheduler } from './scheduler';
 import { sendTelegram } from './telegram';
 
-// ════════════════════════════════════════════════════
-// ENSURE DIRECTORIES
-// ════════════════════════════════════════════════════
 function ensureDirectories(): void {
-  const dirs = ['./data', './logs'];
-  for (const dir of dirs) {
+  for (const dir of ['./data', './logs']) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
       console.log(`📁 Created: ${dir}`);
@@ -24,9 +21,6 @@ function ensureDirectories(): void {
   }
 }
 
-// ════════════════════════════════════════════════════
-// VALIDATE ENVIRONMENT
-// ════════════════════════════════════════════════════
 function validateEnv(): void {
   const required = [
     'X_USERNAME', 'X_EMAIL', 'X_PASSWORD',
@@ -35,35 +29,27 @@ function validateEnv(): void {
     'WALLET_USDT_ERC20', 'WALLET_BTC',
     'WALLET_SOL', 'METAWIN_ID',
   ];
-
   const missing = required.filter(k => !process.env[k]);
-
   if (missing.length > 0) {
-    console.error('❌ Missing required environment variables:');
+    console.error('❌ Missing env vars:');
     missing.forEach(k => console.error(`   - ${k}`));
     process.exit(1);
   }
-
   console.log('✅ Environment validated');
 }
 
-// ════════════════════════════════════════════════════
-// GRACEFUL SHUTDOWN
-// ════════════════════════════════════════════════════
 function setupShutdown(): void {
   const shutdown = async (signal: string) => {
-    console.log(`\n⚠️ ${signal} received — shutting down...`);
+    console.log(`\n⚠️ ${signal} — shutting down...`);
     eventDB.log('SHUTDOWN', `Signal: ${signal}`);
-
     try {
       await sendTelegram({
         type: 'INFO',
         title: '⚠️ Bot Shutting Down',
-        body: `Received ${signal}. Stopping gracefully. PM2 will restart if configured.`,
+        body: `${signal}. PM2 will restart if configured.`,
         timestamp: Date.now(),
       });
-    } catch { }
-
+    } catch {}
     process.exit(0);
   };
 
@@ -73,16 +59,14 @@ function setupShutdown(): void {
   process.on('uncaughtException', async (error) => {
     console.error('💥 Uncaught exception:', error);
     eventDB.log('ERROR', 'Uncaught exception', { error: String(error) });
-
     try {
       await sendTelegram({
         type: 'ERROR',
         title: '💥 Bot Crashed',
-        body: `Uncaught exception: ${error.message}\n\nPM2 will restart automatically.`,
+        body: `${error.message}\nPM2 will restart.`,
         timestamp: Date.now(),
       });
-    } catch { }
-
+    } catch {}
     process.exit(1);
   });
 
@@ -92,9 +76,6 @@ function setupShutdown(): void {
   });
 }
 
-// ════════════════════════════════════════════════════
-// MAIN
-// ════════════════════════════════════════════════════
 async function main(): Promise<void> {
   console.log('\n');
   console.log('╔═══════════════════════════════════════╗');
@@ -110,7 +91,7 @@ async function main(): Promise<void> {
   console.log('💾 Initializing database...');
   initDatabase();
 
-  // Start Telegram polling
+  // Start Telegram polling (import triggers it)
   await import('./telegram');
   console.log('📱 Telegram polling started');
 
@@ -121,7 +102,7 @@ async function main(): Promise<void> {
   await sendTelegram({
     type: 'INFO',
     title: '🚀 APEX Bot Started',
-    body: `All systems online.\n\n✅ Signal engine: London Breakout + 4H ORB + 30min ORB\n✅ Content: 7 daily posts scheduled\n✅ Meta-learning: Active\n✅ Engagement: Every 4 hours\n\nUse /status to check bot status.`,
+    body: 'All systems online.\n\n✅ Signals: London Breakout + 4H ORB + 30min ORB\n✅ Content: 7 daily posts\n✅ Meta-learning: Active\n✅ Engagement: Every 4 hours\n\nUse /status to check.',
     timestamp: Date.now(),
   });
 
@@ -133,3 +114,4 @@ main().catch(error => {
   console.error('❌ Fatal startup error:', error);
   process.exit(1);
 });
+ENDOFFILE

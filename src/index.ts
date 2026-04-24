@@ -1,24 +1,27 @@
+// ════════════════════════════════════════════════════
+// APEX BOT v7.0 — MAIN ENTRY POINT
+// ════════════════════════════════════════════════════
+
 import dotenv from 'dotenv';
 dotenv.config();
 
-import { initDatabase } from './database';
-import { startScheduler } from './scheduler';
-import { sendTelegram } from './telegram';
-import { eventDB } from './database';
 import fs from 'fs';
 import path from 'path';
+import { initDatabase, eventDB } from './database';
+import { startScheduler } from './scheduler';
+import { sendTelegram } from './telegram';
 
 // ════════════════════════════════════════════════════
-// ENSURE DIRECTORIES EXIST
+// ENSURE DIRECTORIES
 // ════════════════════════════════════════════════════
 function ensureDirectories(): void {
   const dirs = ['./data', './logs'];
-  dirs.forEach(dir => {
+  for (const dir of dirs) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
-      console.log(`📁 Created directory: ${dir}`);
+      console.log(`📁 Created: ${dir}`);
     }
-  });
+  }
 }
 
 // ════════════════════════════════════════════════════
@@ -33,15 +36,15 @@ function validateEnv(): void {
     'WALLET_SOL', 'METAWIN_ID',
   ];
 
-  const missing = required.filter(key => !process.env[key]);
+  const missing = required.filter(k => !process.env[k]);
 
   if (missing.length > 0) {
     console.error('❌ Missing required environment variables:');
-    missing.forEach(key => console.error(`   - ${key}`));
+    missing.forEach(k => console.error(`   - ${k}`));
     process.exit(1);
   }
 
-  console.log('✅ Environment variables validated');
+  console.log('✅ Environment validated');
 }
 
 // ════════════════════════════════════════════════════
@@ -49,26 +52,24 @@ function validateEnv(): void {
 // ════════════════════════════════════════════════════
 function setupShutdown(): void {
   const shutdown = async (signal: string) => {
-    console.log(`\n⚠️ ${signal} received — shutting down gracefully...`);
+    console.log(`\n⚠️ ${signal} received — shutting down...`);
+    eventDB.log('SHUTDOWN', `Signal: ${signal}`);
 
     try {
       await sendTelegram({
         type: 'INFO',
         title: '⚠️ Bot Shutting Down',
-        body: `Received ${signal} signal. Bot stopping gracefully.`,
+        body: `Received ${signal}. Stopping gracefully. PM2 will restart if configured.`,
         timestamp: Date.now(),
       });
-    } catch {
-      // Ignore telegram error on shutdown
-    }
+    } catch { }
 
-    eventDB.log('SHUTDOWN', `Bot stopped: ${signal}`);
-    console.log('✅ Shutdown complete');
     process.exit(0);
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT',  () => shutdown('SIGINT'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
   process.on('uncaughtException', async (error) => {
     console.error('💥 Uncaught exception:', error);
     eventDB.log('ERROR', 'Uncaught exception', { error: String(error) });
@@ -77,64 +78,55 @@ function setupShutdown(): void {
       await sendTelegram({
         type: 'ERROR',
         title: '💥 Bot Crashed',
-        body: `Uncaught exception: ${error.message}\n\nBot will restart automatically via PM2.`,
+        body: `Uncaught exception: ${error.message}\n\nPM2 will restart automatically.`,
         timestamp: Date.now(),
       });
-    } catch {
-      // Ignore
-    }
+    } catch { }
 
     process.exit(1);
+  });
+
+  process.on('unhandledRejection', async (reason) => {
+    console.error('💥 Unhandled rejection:', reason);
+    eventDB.log('ERROR', 'Unhandled rejection', { reason: String(reason) });
   });
 }
 
 // ════════════════════════════════════════════════════
-// MAIN STARTUP
+// MAIN
 // ════════════════════════════════════════════════════
 async function main(): Promise<void> {
   console.log('\n');
   console.log('╔═══════════════════════════════════════╗');
-  console.log('║      APEX HYBRID BOT v1.0.0           ║');
-  console.log('║      Trading + Giveaway + Meta-AI     ║');
+  console.log('║       APEX HYBRID BOT v7.0            ║');
+  console.log('║   Trading · Content · Meta-Learning   ║');
   console.log('╚═══════════════════════════════════════╝');
   console.log('\n');
 
-  // Setup
   ensureDirectories();
   validateEnv();
   setupShutdown();
 
-  // Initialize database
   console.log('💾 Initializing database...');
   initDatabase();
 
-  // Import telegram to start polling
+  // Start Telegram polling
   await import('./telegram');
+  console.log('📱 Telegram polling started');
 
-  // Start all scheduled jobs
+  // Start all schedulers
   startScheduler();
 
-  // Send startup notification
+  // Startup notification
   await sendTelegram({
     type: 'INFO',
     title: '🚀 APEX Bot Started',
-    body: `Bot is now running on Oracle Cloud.
-
-✅ Trading bot: Active
-✅ Signal scanning: Every 4 hours
-✅ Trade monitoring: Every 15 min
-✅ Giveaway bot: GitHub Actions
-✅ Meta-learning: Weekly Sunday
-✅ Telegram: Connected
-
-Use /status to check bot status
-Use /help for all commands`,
+    body: `All systems online.\n\n✅ Signal engine: London Breakout + 4H ORB + 30min ORB\n✅ Content: 7 daily posts scheduled\n✅ Meta-learning: Active\n✅ Engagement: Every 4 hours\n\nUse /status to check bot status.`,
     timestamp: Date.now(),
   });
 
-  console.log('\n✅ APEX Bot fully started and running!');
-  console.log('📱 Check your Telegram for confirmation');
-  console.log('💬 Use /status to check bot status\n');
+  console.log('\n✅ APEX Bot fully started');
+  console.log('📱 Check Telegram for confirmation\n');
 }
 
 main().catch(error => {

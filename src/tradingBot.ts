@@ -1,178 +1,226 @@
+// ════════════════════════════════════════════════════
+// APEX BOT v7.0 — TRADING BOT ORCHESTRATOR
+// Scans for signals, posts to X, monitors trades,
+// handles results, feeds meta-learning
+// ════════════════════════════════════════════════════
+
 import { config } from './config';
 import { signalDB, tradeDB, eventDB } from './database';
 import { fetchAllPrices, getCurrentPrice } from './priceMonitor';
-import { generateSignal, checkSignalStatus,
-         formatSignalPost, formatTP1Post,
-         formatTP2Post, formatSLPost } from './signalEngine';
-import { postTweet, loginToX, launchBrowser,
-         closeBrowser } from './puppeteerEngine';
+import {
+  generateSignal,
+  checkSignalStatus,
+  formatSignalPost,
+  formatTP1Post,
+  formatTP2Post,
+  formatSLPost,
+} from './signalEngine';
+import {
+  launchBrowser,
+  loginToX,
+  postTweet,
+  closeBrowser,
+} from './puppeteerEngine';
 import { sendTelegram } from './telegram';
-import { runWeeklyAnalysis, adjustParameters,
-         generateAndSendWeeklyReport } from './metaLearning';
+import { runWeeklyAnalysis, adjustParameters, generateAndSendWeeklyReport } from './metaLearning';
+import { getUniqueTemplate } from './templates';
+import { fetchAllPrices as fetchPrices } from './priceMonitor';
 import type { TradingSignal, TradeRecord } from './types';
 
 // ════════════════════════════════════════════════════
-// GET CURRENT TRADING SESSION
+// SESSION HELPER
 // ════════════════════════════════════════════════════
 function getCurrentSession(): string {
   const hour = new Date().getUTCHours();
-
-  if (hour >= 0 && hour < 9)   return 'Asian Session';
-  if (hour >= 8 && hour < 17)  return 'London Session';
+  if (hour >= 0 && hour < 8) return 'Asian Session';
+  if (hour >= 8 && hour < 17) return 'London Session';
   if (hour >= 13 && hour < 22) return 'New York Session';
   return 'Off Hours';
 }
 
-// ════════════════════════════════════════════════════
-// GET ASSETS FOR CURRENT SESSION
-// ════════════════════════════════════════════════════
-function getSessionAssets(session: string): typeof config.assets {
-  const sessionMap: Record<string, string[]> = {
-    'Asian Session':    config.sessions.asian.assets,
-    'London Session':   config.sessions.london.assets,
-    'New York Session': config.sessions.newYork.assets,
-  };
+function getSessionAssets(): typeof config.assets {
+  const hour = new Date().getUTCHours();
 
-  const sessionAssets = sessionMap[session];
-  if (!sessionAssets) return config.assets; // Off hours — check all
+  // London: FX + Gold
+  if (hour >= 7 && hour < 12) {
+    return config.assets.filter(a =>
+      ['FX', 'COMMODITY'].includes(a.type)
+    );
+  }
 
-  return config.assets.filter(a => sessionAssets.includes(a.symbol));
+  // Crypto 4H check times
+  if ([5, 9, 13, 17, 21].includes(hour)) {
+    return config.assets.filter(a => a.type === 'CRYPTO');
+  }
+
+  // NY index ORB
+  if (hour >= 14 && hour < 16) {
+    return config.assets.filter(a => a.type === 'INDEX');
+  }
+
+  // Default: check all
+  return config.assets;
+}
+
+// ════════════════════════════════════════════════════
+// POST TO X WITH BROWSER
+// Shared helper to avoid repeating browser logic
+// ════════════════════════════════════════════════════
+async function postToX(text: string): Promise<string | null> {
+  try {
+    await launchBrowser();
+    const loggedIn = await loginToX();
+
+    if (!loggedIn) {
+      console.error('[TradingBot] Could not log into X');
+      await closeBrowser();
+      return null;
+    }
+
+    const url = await postTweet(text);
+    await closeBrowser();
+    return url;
+  } catch (error) {
+    console.error('[TradingBot] X post error:', error);
+    await closeBrowser();
+    return null;
+  }
 }
 
 // ════════════════════════════════════════════════════
 // MAIN SIGNAL SCAN
+// Called by scheduler at strategy-specific times
 // ════════════════════════════════════════════════════
 export async function runSignalScan(): Promise<void> {
   const session = getCurrentSession();
-  console.log(`\n📡 Running signal scan — ${session}`);
-  console.log('Time:', new Date().toISOString());
+  const assets = getSessionAssets();
 
-  const sessionAssets = getSessionAssets(session);
-  console.log(`Checking ${sessionAssets.length} assets for ${session}`);
+  console.log(`\n📡 Signal scan — ${session}`);
+  console.log(`   Time: ${new Date().toISOString()}`);
+  console.log(`   Checking ${assets.length} assets`);
 
-  // Fetch price data for session assets
-  const priceMap = await fetchAllPrices();
+  // Check daily limit
+  const todayCount = signalDB.countToday();
+  if (todayCount >= (config.strategy.maxSignalsPerDay || 8)) {
+    console.log(`   ⚠️ Daily signal limit reached (${todayCount}). Skipping scan.`);
+    return;
+  }
+
+  // Fetch price data
+  let priceMap: Map<string, any>;
+  try {
+    priceMap = await fetchAllPrices();
+  } catch (error) {
+    console.error('[TradingBot] Price fetch failed:', error);
+    return;
+  }
 
   let signalsGenerated = 0;
 
-  for (const asset of sessionAssets) {
+  for (const asset of assets) {
     const priceData = priceMap.get(asset.symbol);
     if (!priceData) {
-      console.log(`  ⚠️ No price data for ${asset.symbol}`);
+      console.log(`   ⚠️ No price data for ${asset.symbol}`);
       continue;
     }
 
     try {
       const signal = await generateSignal(priceData, asset, session);
 
-      if (signal) {
-        signalsGenerated++;
+      if (!signal) continue;
 
-        // Save signal to database
-        signalDB.save(signal);
+      signalsGenerated++;
 
-        // Post to X
-        await postSignalToX(signal);
+      // Save to database
+      signalDB.save(signal);
+      console.log(`   ✅ Signal saved: ${signal.symbol} ${signal.direction}`);
 
-        // Notify Telegram
-        await sendTelegram({
-          type: 'SIGNAL',
-          title: `📊 New Signal: ${signal.displayName}`,
-          body: formatSignalPost(signal),
-          timestamp: Date.now(),
-        });
+      // Post to X
+      const postText = formatSignalPost(signal);
+      const postUrl = await postToX(postText);
 
-        // Delay between signals
-        await new Promise(r => setTimeout(r, 5000));
+      if (postUrl) {
+        signalDB.markPosted(signal.id, postUrl);
+        console.log(`   ✅ Signal posted to X: ${postUrl}`);
+      } else {
+        console.log(`   ⚠️ Signal saved but X post failed`);
       }
 
+      // Notify Telegram
+      await sendTelegram({
+        type: 'SIGNAL',
+        title: `📊 New Signal: ${signal.displayName}`,
+        body: postText,
+        timestamp: Date.now(),
+      });
+
+      // Brief delay between signals
+      await new Promise(r => setTimeout(r, 5000));
+
     } catch (error) {
-      console.error(`Error generating signal for ${asset.symbol}:`, error);
+      console.error(`[TradingBot] Signal error for ${asset.symbol}:`, error);
+      eventDB.log('SIGNAL_ERROR', `Failed for ${asset.symbol}`, {
+        error: String(error),
+      });
     }
   }
 
-  console.log(`\n✅ Signal scan complete: ${signalsGenerated} signals generated`);
-}
-
-// ════════════════════════════════════════════════════
-// POST SIGNAL TO X
-// ════════════════════════════════════════════════════
-async function postSignalToX(signal: TradingSignal): Promise<void> {
-  try {
-    await launchBrowser();
-    const loggedIn = await loginToX();
-
-    if (!loggedIn) {
-      console.error('❌ Could not login to post signal');
-      return;
-    }
-
-    const postText = formatSignalPost(signal);
-    const postUrl = await postTweet(postText);
-
-    if (postUrl) {
-      signalDB.markPosted(signal.id, postUrl);
-      console.log(`✅ Signal posted to X: ${signal.symbol}`);
-    }
-
-  } catch (error) {
-    console.error('Error posting to X:', error);
-  } finally {
-    await closeBrowser();
-  }
+  console.log(`\n   Scan complete: ${signalsGenerated} signal(s) generated`);
 }
 
 // ════════════════════════════════════════════════════
 // MONITOR ACTIVE SIGNALS
+// Called every 15 minutes by scheduler
 // ════════════════════════════════════════════════════
 export async function monitorActiveSignals(): Promise<void> {
-  const activeSignals = signalDB.getActive();
+  const active = signalDB.getActive();
 
-  if (activeSignals.length === 0) return;
+  if (active.length === 0) return;
 
-  console.log(`\n👁️ Monitoring ${activeSignals.length} active signals...`);
+  console.log(`\n👁️ Monitoring ${active.length} active signal(s)...`);
 
-  for (const signal of activeSignals) {
+  for (const signal of active) {
     try {
-      // Get current asset config
-      const assetConfig = config.assets.find(a => a.symbol === signal.symbol);
-      if (!assetConfig) continue;
+      const assetCfg = config.assets.find(a => a.symbol === signal.symbol);
+      if (!assetCfg) continue;
 
-      // Get current price
-      const currentPrice = await getCurrentPrice(assetConfig);
-      if (!currentPrice) continue;
+      const currentPrice = await getCurrentPrice(assetCfg);
+      if (!currentPrice) {
+        console.log(`   ⚠️ No current price for ${signal.symbol}`);
+        continue;
+      }
 
-      // Check if any levels hit
       const { newStatus, pnlPips } = checkSignalStatus(signal, currentPrice);
 
-      if (newStatus !== signal.status) {
-        console.log(`\n🚨 ${signal.symbol}: Status changed ${signal.status} → ${newStatus}`);
+      if (newStatus === signal.status) continue;
 
-        // Update in database
-        signalDB.updateStatus(signal.id, newStatus, {
-          pnlPips,
-          tp1HitAt: newStatus === 'TP1_HIT' ? Date.now() : signal.tp1HitAt,
-          tp2HitAt: newStatus === 'TP2_HIT' ? Date.now() : signal.tp2HitAt,
-          slHitAt: newStatus === 'SL_HIT' ? Date.now() : signal.slHitAt,
-        });
+      console.log(`\n   🚨 ${signal.symbol}: ${signal.status} → ${newStatus}`);
 
-        // Post update to X and Telegram
-        await handleStatusChange(signal, newStatus, pnlPips);
+      // Update DB
+      signalDB.updateStatus(signal.id, newStatus, {
+        pnlPips,
+        tp1HitAt: newStatus === 'TP1_HIT' ? Date.now() : signal.tp1HitAt,
+        tp2HitAt: newStatus === 'TP2_HIT' ? Date.now() : signal.tp2HitAt,
+        slHitAt: newStatus === 'SL_HIT' ? Date.now() : signal.slHitAt,
+      });
 
-        // If closed, save trade record for learning
-        if (['TP2_HIT', 'SL_HIT'].includes(newStatus)) {
-          await saveTradeRecord(signal, newStatus, pnlPips, currentPrice);
-        }
+      // Post result to X + Telegram
+      await handleStatusChange(signal, newStatus, pnlPips);
+
+      // Save trade record when fully closed
+      if (['TP2_HIT', 'SL_HIT'].includes(newStatus)) {
+        await saveTradeRecord(signal, newStatus, pnlPips, currentPrice);
       }
 
     } catch (error) {
-      console.error(`Error monitoring ${signal.symbol}:`, error);
+      console.error(`[TradingBot] Monitor error for ${signal.symbol}:`, error);
     }
   }
 }
 
 // ════════════════════════════════════════════════════
 // HANDLE STATUS CHANGE
+// Posts X update + Telegram notification
 // ════════════════════════════════════════════════════
 async function handleStatusChange(
   signal: TradingSignal,
@@ -182,41 +230,38 @@ async function handleStatusChange(
 
   let postText: string;
   let telegramType: 'TP_HIT' | 'SL_HIT' | 'INFO';
+  let telegramTitle: string;
 
   switch (newStatus) {
     case 'TP1_HIT':
       postText = formatTP1Post(signal);
       telegramType = 'TP_HIT';
+      telegramTitle = `✅ TP1 Hit — ${signal.displayName}`;
       break;
     case 'TP2_HIT':
       postText = formatTP2Post(signal);
       telegramType = 'TP_HIT';
+      telegramTitle = `🏆 TP2 Hit — ${signal.displayName} FULL TARGET`;
       break;
     case 'SL_HIT':
       postText = formatSLPost(signal);
       telegramType = 'SL_HIT';
+      telegramTitle = `⚠️ SL Hit — ${signal.displayName}`;
       break;
     default:
       return;
   }
 
   // Post to X
-  try {
-    await launchBrowser();
-    const loggedIn = await loginToX();
-    if (loggedIn) {
-      await postTweet(postText);
-    }
-  } catch (e) {
-    console.error('Failed to post update to X:', e);
-  } finally {
-    await closeBrowser();
+  const url = await postToX(postText);
+  if (url) {
+    console.log(`   ✅ Result posted to X: ${newStatus}`);
   }
 
-  // Notify Telegram
+  // Telegram
   await sendTelegram({
     type: telegramType,
-    title: `${newStatus === 'SL_HIT' ? '⚠️ SL Hit' : '✅ TP Hit'} — ${signal.displayName}`,
+    title: telegramTitle,
     body: postText,
     timestamp: Date.now(),
   });
@@ -228,7 +273,7 @@ async function handleStatusChange(
 }
 
 // ════════════════════════════════════════════════════
-// SAVE TRADE RECORD (for meta-learning)
+// SAVE TRADE RECORD (feeds meta-learning)
 // ════════════════════════════════════════════════════
 async function saveTradeRecord(
   signal: TradingSignal,
@@ -238,7 +283,7 @@ async function saveTradeRecord(
 ): Promise<void> {
 
   const record: TradeRecord = {
-    id: `${signal.id}-closed`,
+    id: `${signal.id}-closed-${Date.now()}`,
     signalId: signal.id,
     symbol: signal.symbol,
     direction: signal.direction,
@@ -249,7 +294,7 @@ async function saveTradeRecord(
     tp2: signal.tp2,
     status: finalStatus as any,
     pnlPips,
-    pnlPercent: (pnlPips / signal.entry) * 100,
+    pnlPercent: signal.entry > 0 ? (pnlPips / signal.entry) * 100 : 0,
     confluenceScore: signal.confluenceScore,
     session: signal.session,
     rsiAtEntry: signal.indicators.rsi.value,
@@ -261,29 +306,101 @@ async function saveTradeRecord(
   };
 
   tradeDB.save(record);
-  console.log(`✅ Trade record saved for meta-learning: ${signal.symbol}`);
+  console.log(`   ✅ Trade record saved for meta-learning (${signal.symbol})`);
+}
+
+// ════════════════════════════════════════════════════
+// DAILY SUMMARY
+// Posts EOD recap to X AND sends detailed to Telegram
+// ════════════════════════════════════════════════════
+export async function sendDailySummary(): Promise<void> {
+  console.log('\n📊 Generating daily summary...');
+
+  const todaySignals = signalDB.countToday();
+  const activeSignals = signalDB.getActive();
+  const recentTrades = tradeDB.getLast7Days();
+
+  const wins = recentTrades.filter(t => t.pnlPips > 0).length;
+  const losses = recentTrades.filter(t => t.pnlPips <= 0).length;
+  const totalPips = Math.round(recentTrades.reduce((s, t) => s + t.pnlPips, 0));
+  const winRate = recentTrades.length > 0
+    ? ((wins / recentTrades.length) * 100).toFixed(1)
+    : '0';
+
+  // Build vars for EOD template
+  const vars: any = {
+    asset: 'EURUSD',
+    direction: 'LONG',
+    entry: 0,
+    stopLoss: 0,
+    tp1: 0,
+    tp2: 0,
+    rr: '0',
+    triggers: '',
+    session: 'EOD',
+    signalsToday: todaySignals,
+    wins,
+    losses,
+    totalPips,
+    asset1: activeSignals[0]?.symbol || 'EURUSD',
+    asset2: activeSignals[1]?.symbol || 'XAUUSD',
+  };
+
+  // Get EOD template and post to X
+  const eodTweet = getUniqueTemplate('eod_recap', vars);
+
+  if (eodTweet) {
+    const finalText = eodTweet.length > 280
+      ? eodTweet.substring(0, 277) + '...'
+      : eodTweet;
+
+    const url = await postToX(finalText);
+    if (url) {
+      console.log('   ✅ EOD recap posted to X');
+    }
+  }
+
+  // Detailed summary to Telegram
+  const telegramBody = [
+    `Signals today: ${todaySignals}`,
+    `Active positions: ${activeSignals.length}`,
+    `7-day record: ${wins}W / ${losses}L`,
+    `7-day win rate: ${winRate}%`,
+    `7-day pips: ${totalPips > 0 ? '+' : ''}${totalPips}`,
+    '',
+    activeSignals.length > 0
+      ? `Open positions:\n${activeSignals.map(s => `  ${s.symbol} ${s.direction} @ ${s.entry} [${s.status}]`).join('\n')}`
+      : 'No open positions.',
+    '',
+    'Bot: ✅ Running',
+  ].join('\n');
+
+  await sendTelegram({
+    type: 'DAILY_SUMMARY',
+    title: '📊 Daily Summary',
+    body: telegramBody,
+    timestamp: Date.now(),
+  });
+
+  console.log('   ✅ Daily summary sent to Telegram');
 }
 
 // ════════════════════════════════════════════════════
 // WEEKLY ROUTINE
+// Runs meta-learning, adjusts params, posts to X + Telegram
 // ════════════════════════════════════════════════════
 export async function runWeeklyRoutine(): Promise<void> {
-  console.log('\n🧠 Running weekly meta-learning routine...');
+  console.log('\n🧠 Running weekly routine...');
 
   try {
-    // Analyze performance
     const metrics = await runWeeklyAnalysis();
-
-    // Auto-adjust parameters
     await adjustParameters(metrics);
-
-    // Generate and send report
     await generateAndSendWeeklyReport(metrics);
 
     console.log('✅ Weekly routine complete');
-
   } catch (error) {
-    console.error('❌ Weekly routine failed:', error);
+    console.error('[TradingBot] Weekly routine error:', error);
+
     await sendTelegram({
       type: 'ERROR',
       title: '❌ Weekly Routine Failed',
@@ -291,35 +408,4 @@ export async function runWeeklyRoutine(): Promise<void> {
       timestamp: Date.now(),
     });
   }
-}
-
-// ════════════════════════════════════════════════════
-// DAILY SUMMARY
-// ════════════════════════════════════════════════════
-export async function sendDailySummary(): Promise<void> {
-  const todaySignals = signalDB.countToday();
-  const activeSignals = signalDB.getActive();
-  const winRate = tradeDB.getWinRate();
-
-  const summary = [
-    `📅 Daily Summary`,
-    ``,
-    `Signals today: ${todaySignals}`,
-    `Active signals: ${activeSignals.length}`,
-    `30-day win rate: ${winRate.toFixed(1)}%`,
-    ``,
-    `Active positions:`,
-    ...activeSignals.map(s =>
-      `  ${s.symbol} ${s.direction} @ ${s.entry} [${s.status}]`
-    ),
-    ``,
-    `Bot status: ✅ Running`,
-  ].join('\n');
-
-  await sendTelegram({
-    type: 'DAILY_SUMMARY',
-    title: '📊 Daily Summary',
-    body: summary,
-    timestamp: Date.now(),
-  });
 }

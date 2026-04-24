@@ -1,35 +1,33 @@
 {
   "name": "apex-bot",
-  "version": "1.0.0",
-  "description": "APEX Hybrid Trading & Giveaway Bot",
+  "version": "7.0.0",
+  "description": "APEX Hybrid Trading Bot",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts",
-    "giveaway": "ts-node src/giveawayBot.ts --standalone",
-    "setup": "ts-node src/database.ts --init"
+    "dev": "ts-node src/index.ts"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
     "axios": "^1.7.9",
     "better-sqlite3": "^11.5.0",
     "cron": "^3.1.7",
+    "dotenv": "^16.4.7",
+    "node-cron": "^3.0.3",
     "node-telegram-bot-api": "^0.66.0",
     "puppeteer": "^23.11.1",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "technicalindicators": "^3.1.0",
     "winston": "^3.17.0",
-    "dotenv": "^16.4.7",
-    "node-cron": "^3.0.3",
     "yahoo-finance2": "^2.13.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
-    "@types/node-telegram-bot-api": "^0.64.7",
     "@types/node-cron": "^3.0.11",
+    "@types/node-telegram-bot-api": "^0.64.7",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.2"
   }

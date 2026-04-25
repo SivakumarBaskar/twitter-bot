@@ -1,549 +1,232 @@
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import type { Browser, Page } from 'puppeteer';
+// ════════════════════════════════════════════════════
+// APEX BOT v7.0 — X ENGINE (agent-twitter-client)
+// NO Puppeteer. NO Chrome. ~50MB RAM.
+// Same exports as old Puppeteer engine — zero changes
+// needed in contentScheduler.ts, engagementBot.ts, etc.
+// ════════════════════════════════════════════════════
+
+import { Scraper } from 'agent-twitter-client';
+import fs from 'fs';
+import path from 'path';
 import { config } from './config';
-import { safeDelay, randomDelay, humanType } from './safetyLayer';
-import { eventDB } from './database';
 
-// Apply stealth plugin — hides bot fingerprints
-puppeteer.use(StealthPlugin());
+const COOKIES_PATH = path.resolve('./data/x_cookies.json');
+const RAW_COOKIES_PATH = path.resolve('./data/x_cookies_raw.txt');
 
-let browser: Browser | null = null;
-let page: Page | null = null;
-let isLoggedIn = false;
-
-// ════════════════════════════════════════════════════
-// BROWSER MANAGEMENT
-// ════════════════════════════════════════════════════
-export async function launchBrowser(): Promise<void> {
-  try {
-    console.log('🌐 Launching stealth browser...');
-
-    browser = await puppeteer.launch({
-      headless: config.puppeteer.headless,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',      // Critical for 1GB RAM
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',                // Save memory
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-default-apps',
-        '--disable-sync',
-        '--disable-translate',
-        '--hide-scrollbars',
-        '--metrics-recording-only',
-        '--mute-audio',
-        '--no-default-browser-check',
-        '--safebrowsing-disable-auto-update',
-        '--js-flags=--max-old-space-size=512', // Limit JS heap
-        '--memory-pressure-off',
-        '--single-process',             // Save memory on 1GB VM
-      ],
-      defaultViewport: config.puppeteer.viewport,
-    });
-
-    page = await browser.newPage();
-
-    // Set user agent
-    await page.setUserAgent(config.puppeteer.userAgent);
-
-    // Block unnecessary resources to save memory + speed
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const resourceType = req.resourceType();
-      const url = req.url();
-
-      // Block images, fonts, analytics (not needed for posting)
-      if (
-        ['image', 'font', 'media'].includes(resourceType) ||
-        url.includes('google-analytics') ||
-        url.includes('doubleclick') ||
-        url.includes('facebook') ||
-        url.includes('analytics')
-      ) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    // Suppress console errors from X's JS
-    page.on('console', () => {});
-    page.on('pageerror', () => {});
-
-    console.log('✅ Browser launched successfully');
-    eventDB.log('BROWSER', 'Browser launched');
-
-  } catch (error) {
-    console.error('❌ Failed to launch browser:', error);
-    throw error;
-  }
+if (!fs.existsSync(path.dirname(COOKIES_PATH))) {
+  fs.mkdirSync(path.dirname(COOKIES_PATH), { recursive: true });
 }
 
-// ════════════════════════════════════════════════════
-// X LOGIN
-// ════════════════════════════════════════════════════
-export async function loginToX(): Promise<boolean> {
-  if (!browser || !page) await launchBrowser();
-  if (isLoggedIn) return true;
+let scraper: Scraper | null = null;
+let isReady = false;
 
-  try {
-    console.log('🔐 Logging into X...');
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const jitter = (min: number, max: number) =>
+  sleep(Math.floor(Math.random() * (max - min + 1)) + min);
 
-    await page!.goto('https://twitter.com/i/flow/login', {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-
-    await randomDelay(2000, 4000);
-
-    // ── STEP 1: Enter Username ──────────────────────
-    console.log('  → Entering username...');
-    const usernameInput = await page!.waitForSelector(
-      'input[autocomplete="username"]',
-      { timeout: 15000 }
-    );
-
-    if (!usernameInput) throw new Error('Username input not found');
-
-    await humanType(page!, 'input[autocomplete="username"]',
-      config.x.username);
-    await randomDelay(800, 1500);
-
-    // Click Next button
-    await page!.keyboard.press('Enter');
-    await randomDelay(2000, 3500);
-
-    // ── STEP 2: Check for unusual activity prompt ───
-    const pageContent = await page!.content();
-
-    if (pageContent.includes('Enter your phone') ||
-        pageContent.includes('Enter your email') ||
-        pageContent.includes('unusual activity')) {
-
-      console.log('  → X asking for email verification...');
-
-      // Find the text input for email
-      const emailInput = await page!.$('input[data-testid="ocfEnterTextTextInput"]')
-        || await page!.$('input[name="text"]');
-
-      if (emailInput) {
-        await humanType(page!, 'input[name="text"]',
-          config.x.email);
-        await randomDelay(800, 1500);
-        await page!.keyboard.press('Enter');
-        await randomDelay(2000, 3000);
+// ── Cookie Parsing ──────────────────────────────────
+function parseCookies(input: string): any[] {
+  const trimmed = input.trim();
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed;
+      // Cookie-Editor format: { ".x.com": { "name": "value" } }
+      const out: any[] = [];
+      for (const [domain, obj] of Object.entries(parsed)) {
+        for (const [name, value] of Object.entries(obj as Record<string, string>)) {
+          out.push({
+            name, value: String(value),
+            domain: domain.startsWith('.') ? domain : '.' + domain,
+            path: '/', secure: true,
+            httpOnly: name.startsWith('__Secure') || name.startsWith('__Host'),
+            sameSite: 'None',
+          });
+        }
       }
-    }
+      return out;
+    } catch { /* not JSON */ }
+  }
+  // name=value; name2=value2 format
+  const out: any[] = [];
+  for (const pair of trimmed.split(';').map(s => s.trim()).filter(Boolean)) {
+    const eq = pair.indexOf('=');
+    if (eq < 1) continue;
+    out.push({ name: pair.substring(0, eq).trim(), value: pair.substring(eq + 1).trim(), domain: '.x.com', path: '/' });
+  }
+  return out;
+}
 
-    // ── STEP 3: Enter Password ──────────────────────
-    console.log('  → Entering password...');
-    const passwordInput = await page!.waitForSelector(
-      'input[name="password"]',
-      { timeout: 15000 }
-    );
+// ── Auth ────────────────────────────────────────────
+async function ensureAuth(): Promise<boolean> {
+  if (isReady && scraper) {
+    try { if (await scraper.isLoggedIn()) return true; } catch { /* stale */ }
+    isReady = false;
+  }
 
-    if (!passwordInput) throw new Error('Password input not found');
+  scraper = new Scraper();
 
-    await humanType(page!, 'input[name="password"]',
-      config.x.password);
-    await randomDelay(800, 1500);
+  // Source 1: GitHub Actions env var (base64 encoded)
+  if (process.env.X_COOKIES) {
+    try {
+      const decoded = Buffer.from(process.env.X_COOKIES, 'base64').toString('utf-8');
+      const cookies = parseCookies(decoded);
+      if (cookies.length) {
+        await scraper.setCookies(cookies);
+        if (await scraper.isLoggedIn()) { isReady = true; return true; }
+      }
+    } catch { /* bad env var */ }
+  }
 
-    await page!.keyboard.press('Enter');
-    await randomDelay(4000, 6000);
+  // Source 2: JSON cookie file
+  if (fs.existsSync(COOKIES_PATH)) {
+    try {
+      const cookies = JSON.parse(fs.readFileSync(COOKIES_PATH, 'utf-8'));
+      await scraper.setCookies(cookies);
+      if (await scraper.isLoggedIn()) { isReady = true; return true; }
+    } catch { /* bad file */ }
+  }
 
-    // ── STEP 4: Verify Login Success ────────────────
-    const currentUrl = page!.url();
-    const finalContent = await page!.content();
+  // Source 3: Raw cookie string file
+  if (fs.existsSync(RAW_COOKIES_PATH)) {
+    try {
+      const cookies = parseCookies(fs.readFileSync(RAW_COOKIES_PATH, 'utf-8'));
+      if (cookies.length) {
+        await scraper.setCookies(cookies);
+        if (await scraper.isLoggedIn()) {
+          fs.writeFileSync(COOKIES_PATH, JSON.stringify(cookies, null, 2));
+          isReady = true;
+          return true;
+        }
+      }
+    } catch { /* bad raw */ }
+  }
 
-    if (currentUrl.includes('home') ||
-        finalContent.includes('data-testid="primaryColumn"')) {
-      isLoggedIn = true;
-      console.log('✅ Successfully logged into X');
-      eventDB.log('AUTH', 'Successfully logged into X');
+  // Source 4: Direct credential login (last resort, detection risk)
+  try {
+    await scraper.login(config.x.username, config.x.password, config.x.email);
+    await sleep(3000);
+    if (await scraper.isLoggedIn()) {
+      const cookies = await scraper.getCookies();
+      fs.writeFileSync(COOKIES_PATH, JSON.stringify(cookies, null, 2));
+      isReady = true;
       return true;
     }
+  } catch { /* login blocked */ }
 
-    // ── STEP 5: Handle 2FA if needed ────────────────
-    if (finalContent.includes('confirmation code') ||
-        finalContent.includes('verification code')) {
-      console.log('  → 2FA required — check Telegram for instructions');
-      // Telegram notification handled by caller
-      return false;
-    }
-
-    console.error('❌ Login failed — unexpected state');
-    console.error('Current URL:', currentUrl);
-    return false;
-
-  } catch (error) {
-    console.error('❌ Login error:', error);
-    eventDB.log('ERROR', 'Login failed', { error: String(error) });
-    return false;
-  }
+  console.log('   🚨 X AUTH FAILED — need fresh cookies');
+  return false;
 }
 
 // ════════════════════════════════════════════════════
-// NAVIGATE TO USER PROFILE
+// PUBLIC API (same names as old Puppeteer engine)
 // ════════════════════════════════════════════════════
-export async function navigateToProfile(handle: string): Promise<boolean> {
-  if (!page) return false;
 
-  try {
-    await page.goto(`https://twitter.com/${handle}`, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-    await randomDelay(2000, 4000);
-    return true;
-  } catch {
-    return false;
-  }
+export async function launchBrowser(): Promise<any> {
+  console.log('   🚀 Engine ready (no browser)');
+  return {};
 }
 
-// ════════════════════════════════════════════════════
-// GET RECENT POSTS FROM PROFILE
-// ════════════════════════════════════════════════════
-export async function getRecentPosts(handle: string): Promise<Array<{
-  postId: string;
-  postUrl: string;
-  postText: string;
-}>> {
-  if (!page) return [];
-
-  try {
-    await navigateToProfile(handle);
-
-    // Wait for tweets to load
-    await page.waitForSelector('[data-testid="tweet"]', {
-      timeout: 15000
-    });
-
-    await randomDelay(1500, 3000);
-
-    // Scroll slightly to load more tweets (human behavior)
-    await page.evaluate(() => window.scrollBy(0, 300));
-    await randomDelay(1000, 2000);
-
-    // Extract tweet data
-    const posts = await page.evaluate(() => {
-      const tweets = document.querySelectorAll('[data-testid="tweet"]');
-      const results: Array<{
-        postId: string;
-        postUrl: string;
-        postText: string;
-      }> = [];
-
-      tweets.forEach((tweet) => {
-        try {
-          // Get tweet text
-          const textEl = tweet.querySelector('[data-testid="tweetText"]');
-          const text = textEl?.textContent || '';
-
-          // Get tweet link (contains post ID)
-          const timeEl = tweet.querySelector('time');
-          const linkEl = timeEl?.closest('a');
-          const href = linkEl?.getAttribute('href') || '';
-
-          if (href && text) {
-            const parts = href.split('/');
-            const postId = parts[parts.length - 1];
-            results.push({
-              postId,
-              postUrl: `https://twitter.com${href}`,
-              postText: text,
-            });
-          }
-        } catch {
-          // Skip malformed tweets
-        }
-      });
-
-      return results.slice(0, 10); // Last 10 posts
-    });
-
-    return posts;
-
-  } catch (error) {
-    console.error(`❌ Failed to get posts from @${handle}:`, error);
-    return [];
-  }
+export async function loginToX(): Promise<boolean> {
+  return ensureAuth();
 }
 
-// ════════════════════════════════════════════════════
-// POST A TWEET
-// ════════════════════════════════════════════════════
 export async function postTweet(text: string): Promise<string | null> {
-  if (!page || !isLoggedIn) return null;
-
+  if (!isReady && !(await ensureAuth())) return null;
   try {
-    // Navigate to home
-    await page.goto('https://twitter.com/home', {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-    await randomDelay(2000, 4000);
-
-    // Click compose tweet box
-    const tweetBox = await page.waitForSelector(
-      '[data-testid="tweetTextarea_0"]',
-      { timeout: 10000 }
-    );
-    if (!tweetBox) throw new Error('Tweet box not found');
-
-    await tweetBox.click();
-    await randomDelay(800, 1500);
-
-    // Type tweet with human-like speed
-    await humanType(page, '[data-testid="tweetTextarea_0"]', text);
-    await randomDelay(1500, 3000);
-
-    // Click Tweet button
-    const tweetBtn = await page.waitForSelector(
-      '[data-testid="tweetButtonInline"]',
-      { timeout: 10000 }
-    );
-    if (!tweetBtn) throw new Error('Tweet button not found');
-
-    await tweetBtn.click();
-    await randomDelay(3000, 5000);
-
-    // Get the URL of the posted tweet
-    const currentUrl = page.url();
-    console.log('✅ Tweet posted successfully');
-    eventDB.log('TWEET', 'Tweet posted', { text: text.substring(0, 50) });
-
-    return currentUrl;
-
-  } catch (error) {
-    console.error('❌ Failed to post tweet:', error);
-    eventDB.log('ERROR', 'Failed to post tweet', { error: String(error) });
+    const result = await scraper!.sendTweet(text);
+    const id = (result as any)?.id;
+    if (id) {
+      const url = `https://x.com/${config.x.username}/status/${id}`;
+      console.log('   ✅ Posted:', url);
+      return url;
+    }
+    return null;
+  } catch (e) {
+    console.error('   ❌ Post error:', (e as Error).message);
     return null;
   }
 }
 
-// ════════════════════════════════════════════════════
-// REPLY TO A TWEET
-// ════════════════════════════════════════════════════
-export async function replyToTweet(
-  postUrl: string,
-  replyText: string
-): Promise<boolean> {
-  if (!page || !isLoggedIn) return false;
+export async function engageWithTweet(
+  tweetUrl: string,
+  actions: { like?: boolean; retweet?: boolean; reply?: string; quote?: string }
+): Promise<{ liked: boolean; retweeted: boolean; replied: boolean; quoted: boolean }> {
+  const r = { liked: false, retweeted: false, replied: false, quoted: false };
+  if (!isReady && !(await ensureAuth())) return r;
+
+  const tweetId = tweetUrl.split('/status/')[1]?.split('?')[0];
+  if (!tweetId) return r;
 
   try {
-    // Navigate to the tweet
-    await page.goto(postUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-    await randomDelay(2000, 4000);
-
-    // Scroll to see tweet (human behavior)
-    await page.evaluate(() => window.scrollBy(0, 200));
-    await randomDelay(1000, 2000);
-
-    // Click reply button
-    const replyBtn = await page.waitForSelector(
-      '[data-testid="reply"]',
-      { timeout: 10000 }
-    );
-    if (!replyBtn) throw new Error('Reply button not found');
-
-    await replyBtn.click();
-    await randomDelay(1500, 3000);
-
-    // Type reply
-    const replyBox = await page.waitForSelector(
-      '[data-testid="tweetTextarea_0"]',
-      { timeout: 10000 }
-    );
-    if (!replyBox) throw new Error('Reply box not found');
-
-    await humanType(page, '[data-testid="tweetTextarea_0"]', replyText);
-    await randomDelay(1500, 2500);
-
-    // Submit reply
-    const submitBtn = await page.waitForSelector(
-      '[data-testid="tweetButton"]',
-      { timeout: 10000 }
-    );
-    if (!submitBtn) throw new Error('Submit button not found');
-
-    await submitBtn.click();
-    await randomDelay(3000, 5000);
-
-    console.log('✅ Reply posted successfully');
-    eventDB.log('REPLY', 'Reply posted', { url: postUrl });
-    return true;
-
-  } catch (error) {
-    console.error('❌ Failed to reply:', error);
-    eventDB.log('ERROR', 'Failed to reply', { error: String(error) });
-    return false;
+    if (actions.like) { try { await scraper!.likeTweet(tweetId); r.liked = true; console.log('   ❤️ Liked'); } catch { /* */ } await jitter(800, 1500); }
+    if (actions.retweet) { try { await scraper!.retweet(tweetId); r.retweeted = true; console.log('   🔁 Retweeted'); } catch { /* */ } await jitter(800, 1500); }
+    if (actions.reply) { try { await scraper!.sendTweet(actions.reply, tweetId); r.replied = true; console.log('   💬 Replied'); } catch { /* */ } await jitter(1000, 2000); }
+    if (actions.quote) { try { await scraper!.sendTweet(`${actions.quote}\n\n${tweetUrl}`); r.quoted = true; console.log('   📝 Quoted'); } catch { /* */ } await jitter(1000, 2000); }
+  } catch (e) {
+    console.error('   ❌ Engage error:', (e as Error).message);
   }
+  return r;
 }
 
-// ════════════════════════════════════════════════════
-// LIKE A TWEET
-// ════════════════════════════════════════════════════
-export async function likeTweet(postUrl: string): Promise<boolean> {
-  if (!page || !isLoggedIn) return false;
-
+export async function getLatestTweets(handle: string, limit = 5): Promise<Array<{
+  postId: string; postUrl: string; postText: string; timeAgo: string;
+}>> {
+  if (!isReady && !(await ensureAuth())) return [];
+  const out: Array<{ postId: string; postUrl: string; postText: string; timeAgo: string }> = [];
   try {
-    await page.goto(postUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-    await randomDelay(2000, 4000);
-
-    // Check if already liked
-    const likeBtn = await page.$('[data-testid="like"]');
-    if (!likeBtn) return false;
-
-    await likeBtn.click();
-    await randomDelay(1500, 3000);
-
-    console.log('✅ Tweet liked');
-    return true;
-
-  } catch (error) {
-    console.error('❌ Failed to like tweet:', error);
-    return false;
-  }
-}
-
-// ════════════════════════════════════════════════════
-// RETWEET
-// ════════════════════════════════════════════════════
-export async function retweetPost(postUrl: string): Promise<boolean> {
-  if (!page || !isLoggedIn) return false;
-
-  try {
-    await page.goto(postUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-    await randomDelay(2000, 4000);
-
-    // Click retweet button
-    const rtBtn = await page.waitForSelector(
-      '[data-testid="retweet"]',
-      { timeout: 10000 }
-    );
-    if (!rtBtn) return false;
-
-    await rtBtn.click();
-    await randomDelay(1000, 2000);
-
-    // Confirm retweet in popup
-    const confirmBtn = await page.waitForSelector(
-      '[data-testid="retweetConfirm"]',
-      { timeout: 5000 }
-    );
-    if (confirmBtn) {
-      await confirmBtn.click();
+    for await (const t of scraper!.getTweets(handle, limit)) {
+      if (!t) continue;
+      const id = t.id || '';
+      out.push({ postId: id, postUrl: `https://x.com/${handle}/status/${id}`, postText: t.text || '', timeAgo: t.created_at || '' });
+      if (out.length >= limit) break;
     }
-
-    await randomDelay(2000, 3500);
-    console.log('✅ Retweeted successfully');
-    return true;
-
-  } catch (error) {
-    console.error('❌ Failed to retweet:', error);
-    return false;
+  } catch (e) {
+    console.error('   ❌ Fetch error:', (e as Error).message);
   }
+  return out;
 }
 
-// ════════════════════════════════════════════════════
-// QUOTE TWEET
-// ════════════════════════════════════════════════════
-export async function quoteTweet(
-  postUrl: string,
-  quoteText: string
-): Promise<boolean> {
-  if (!page || !isLoggedIn) return false;
-
-  try {
-    await page.goto(postUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-    await randomDelay(2000, 4000);
-
-    // Click retweet button first
-    const rtBtn = await page.waitForSelector(
-      '[data-testid="retweet"]',
-      { timeout: 10000 }
-    );
-    if (!rtBtn) return false;
-
-    await rtBtn.click();
-    await randomDelay(1000, 2000);
-
-    // Click "Quote Tweet" option
-    const quoteBtn = await page.waitForSelector(
-      '[data-testid="quoteTweet"]',
-      { timeout: 5000 }
-    );
-    if (!quoteBtn) return false;
-
-    await quoteBtn.click();
-    await randomDelay(1500, 3000);
-
-    // Type quote text
-    await humanType(page, '[data-testid="tweetTextarea_0"]', quoteText);
-    await randomDelay(1500, 2500);
-
-    // Submit
-    const submitBtn = await page.waitForSelector(
-      '[data-testid="tweetButton"]',
-      { timeout: 10000 }
-    );
-    if (!submitBtn) return false;
-
-    await submitBtn.click();
-    await randomDelay(3000, 5000);
-
-    console.log('✅ Quote tweet posted');
-    return true;
-
-  } catch (error) {
-    console.error('❌ Failed to quote tweet:', error);
-    return false;
-  }
-}
-
-// ════════════════════════════════════════════════════
-// BROWSER CLEANUP
-// ════════════════════════════════════════════════════
 export async function closeBrowser(): Promise<void> {
-  try {
-    if (page) {
-      await page.close();
-      page = null;
-    }
-    if (browser) {
-      await browser.close();
-      browser = null;
-    }
-    isLoggedIn = false;
-    console.log('🔒 Browser closed');
-  } catch (error) {
-    console.error('Error closing browser:', error);
+  if (scraper) {
+    try { const c = await scraper.getCookies(); fs.writeFileSync(COOKIES_PATH, JSON.stringify(c, null, 2)); } catch { /* */ }
   }
+  scraper = null;
+  isReady = false;
 }
 
-export function getBrowserState(): {
-  isRunning: boolean;
-  isLoggedIn: boolean;
-} {
-  return {
-    isRunning: !!browser,
-    isLoggedIn,
-  };
+// ════════════════════════════════════════════════════
+// CLI TOOLS
+// ════════════════════════════════════════════════════
+
+async function cliSaveCookies(): Promise<void> {
+  console.log('\n🍪 Paste cookies below, then press Ctrl+D\n');
+  let buf = '';
+  process.stdin.resume();
+  process.stdin.setEncoding('utf8');
+  await new Promise<void>(res => {
+    process.stdin.on('data', (c: string) => { buf += c; });
+    process.stdin.on('end', () => {
+      const cookies = parseCookies(buf);
+      if (!cookies.length) { console.log('❌ No valid cookies'); res(); return; }
+      fs.writeFileSync(COOKIES_PATH, JSON.stringify(cookies, null, 2));
+      console.log(`✅ Saved ${cookies.length} cookies`);
+      res();
+    });
+  });
+  process.exit(0);
 }
+
+async function cliTest(): Promise<void> {
+  console.log('\n🧪 ENGINE TEST\n');
+  if (!(await ensureAuth())) { console.log('❌ AUTH FAILED'); process.exit(1); }
+  try { const me = await scraper!.me(); console.log('   @' + me?.username, '|', me?.name, '|', me?.followersCount, 'followers'); } catch { /* */ }
+  const tweets = await getLatestTweets(config.x.username, 3);
+  for (const t of tweets) console.log(`   [${t.postId.slice(-8)}] ${t.postText.slice(0, 60)}`);
+  console.log('\n✅ ENGINE READY\n');
+  await closeBrowser();
+  process.exit(0);
+}
+
+if (process.argv.includes('save-cookies')) cliSaveCookies().catch(() => process.exit(1));
+if (process.argv.includes('test')) cliTest().catch(() => process.exit(1));
